@@ -4,7 +4,7 @@
 import os
 from dotenv import load_dotenv
 
-# --- All other necessary imports from your original script ---
+# --- All other necessary imports ---
 from typing import Annotated, Literal
 from typing_extensions import TypedDict
 from langchain_community.tools import ArxivQueryRun, WikipediaQueryRun
@@ -31,32 +31,40 @@ def get_graph():
         print("Warning: API keys not found. The script may fail.")
 
     # --- 3. Tool Definitions ---
-    api_wrapper_arxiv = ArxivAPIWrapper(top_k_results=2, doc_content_chars_max=1000)
-    arxiv_tool = ArxivQueryRun(api_wrapper=api_wrapper_arxiv, description="Searches for and returns summaries of papers from Arxiv.")
+    api_wrapper_arxiv = ArxivQueryRun(api_wrapper=api_wrapper_arxiv, description="Searches for and returns summaries of papers from Arxiv.")
     api_wrapper_wiki = WikipediaAPIWrapper(top_k_results=1, doc_content_chars_max=1000)
     wikipedia_tool = WikipediaQueryRun(api_wrapper=api_wrapper_wiki, description="Searches Wikipedia for information.")
     tavily_tool = TavilySearch(max_results=3, description="A search engine for finding up-to-date information.")
 
     def calculator(expression: str) -> str:
-        """Evaluates a mathematical expression or solves a single variable linear equation."""
+        """
+        Solves single-variable equations, including linear and quadratic ones.
+        The user's query is passed directly to this tool.
+        Use standard Python syntax for equations, e.g., '14*x**2 + 20*x + 3 = 0'.
+        """
         try:
+            from sympy import sympify, solve, symbols, Eq
+            from sympy.core.sympify import SympifyError
+
             if '=' in expression:
-                from sympy import sympify, solve
-                if 'x' in expression and expression.count('x') == 1:
-                    parts = expression.split('=')
-                    lhs = sympify(parts[0])
-                    rhs = sympify(parts[1])
-                    solution = solve(lhs - rhs)
-                    result = f"The solution to '{expression}' is x = {solution[0]}."
-                else:
-                    result = "Calculator can only solve single variable linear equations."
+                expression = expression.replace('x*x', '*x**2').replace('^', '**')
+                lhs, rhs = expression.split('=')
+                x = symbols('x')
+                lhs_expr = sympify(lhs.strip())
+                rhs_expr = sympify(rhs.strip())
+                equation = Eq(lhs_expr, rhs_expr)
+                solutions = solve(equation, x)
+                if not solutions:
+                    return "No real solution found for the equation."
+                formatted_solutions = [f"{s.evalf(4)}" for s in solutions]
+                return f"The solutions are: x = {', '.join(formatted_solutions)}"
             else:
                 result = eval(expression, {"__builtins__": None}, {})
-            return f"The result of '{expression}' is {result}."
-        except Exception as e:
-            return f"Failed to evaluate the expression. Error: {e}"
+                return f"The result of '{expression}' is {result}."
+        except (SympifyError, NameError, SyntaxError, Exception) as e:
+            return f"Could not process the expression. Please check the format. Error: {str(e)}"
 
-    calculator_tool = StructuredTool.from_function(func=calculator, name="Calculator", description="Evaluates a mathematical expression or solves a single variable linear equation.")
+    calculator_tool = StructuredTool.from_function(func=calculator, name="Calculator", description="Solves mathematical equations, including quadratic ones.")
 
     original_agent_tools = [arxiv_tool, wikipedia_tool, tavily_tool, calculator_tool]
     technical_tools = [arxiv_tool, wikipedia_tool]
@@ -73,31 +81,40 @@ def get_graph():
     # --- 5. Graph State and Router Definition ---
     class State(TypedDict):
         messages: Annotated[list[AnyMessage], lambda x, y: x + y]
-
+    
+    # FIX: Replaced LLM router with a more robust, deterministic keyword-based router
     def master_router(state: State) -> Literal["original_agent", "technical_agent", "math_agent", "general_agent"]:
-        """Determines the most appropriate agent to handle the user's query."""
-        last_message = state["messages"][-1].content
-        router_prompt = f"""You are an expert at routing a user's query to the correct agent.
-        You have four agents available:
-        1.  **original_agent**: A generalist agent for simple, conversational queries.
-        2.  **technical_agent**: A specialist for complex questions about computer science, programming, or scientific papers.
-        3.  **math_agent**: A specialist for questions involving mathematical calculations, formulas, or solving equations.
-        4.  **general_agent**: A specialist for other specific questions that require deep research using web search or Wikipedia.
-        Based on the user's query below, choose the most appropriate agent.
-        User Query: "{last_message}"
-        Chosen Agent:"""
-        response = llm.invoke(router_prompt)
-        choice = response.content.strip().lower()
-        if "technical_agent" in choice: return "technical_agent"
-        if "math_agent" in choice: return "math_agent"
-        if "general_agent" in choice: return "general_agent"
+        """Determines the most appropriate agent based on keywords in the user's query."""
+        last_message = state["messages"][-1].content.lower()
+        
+        # 1. Prioritize math for any query with numbers or explicit math terms
+        math_keywords = ['solve', 'calculate', 'equation', 'math', '+', '-', '*', '/', '=', 'x']
+        if any(keyword in last_message for keyword in math_keywords) or any(char.isdigit() for char in last_message):
+            print("--- Routing to Math Specialist ---")
+            return "math_agent"
+            
+        # 2. Route to technical agent for specific tech terms
+        tech_keywords = ['code', 'python', 'javascript', 'computer science', 'algorithm', 'arxiv', 'paper', 'ml', 'ai', 'neural network']
+        if any(keyword in last_message for keyword in tech_keywords):
+            print("--- Routing to Technical Specialist ---")
+            return "technical_agent"
+            
+        # 3. Route to general agent for research-style questions
+        general_keywords = ['who is', 'what is', 'what are', 'explain', 'summary of', 'tell me about']
+        if any(keyword in last_message for keyword in general_keywords):
+            print("--- Routing to General Specialist ---")
+            return "general_agent"
+            
+        # 4. Default to the original agent for everything else (simple conversation)
+        print("--- Routing to Original Agent ---")
         return "original_agent"
 
     # --- 6. Agent Node Definitions ---
     def agent_node(state: State, llm_with_tools, agent_name: str):
         """Generic function to run an agent's logic."""
+        # FIX: Updated system prompt to be more direct and avoid "thinking out loud"
         prompt = ChatPromptTemplate.from_messages([
-            ("system", f"You are a helpful assistant, acting as a specialized {agent_name}. You talk like a friendly buddy. Answer all questions to the best of your ability. Include a 😄 emoji in your responses."),
+            ("system", f"You are a helpful assistant, acting as a specialized {agent_name}. You talk like a friendly buddy. You must follow these rules: 1. If the user's query can be answered with a tool, call the tool immediately. Do not explain that you are using a tool. 2. If no tool is needed, provide a direct answer to the user's question without any introductory phrases about your process. 3. Always include a 😄 emoji in your final response."),
             MessagesPlaceholder(variable_name="messages"),
         ])
         chain = prompt | llm_with_tools
@@ -116,6 +133,7 @@ def get_graph():
     general_tool_node = ToolNode(general_tools)
 
     def should_continue(state: State) -> Literal["tools", "__end__"]:
+        """Decides whether to call a tool or end the turn."""
         if isinstance(state["messages"][-1], AIMessage) and state["messages"][-1].tool_calls:
             return "tools"
         return "__end__"
@@ -129,14 +147,17 @@ def get_graph():
     builder.add_node("technical_agent", technical_agent_node)
     builder.add_node("math_agent", math_agent_node)
     builder.add_node("general_agent", general_agent_node)
+    
     builder.add_conditional_edges("original_agent", should_continue, {"tools": "original_tools", "__end__": END})
     builder.add_conditional_edges("technical_agent", should_continue, {"tools": "technical_tools", "__end__": END})
     builder.add_conditional_edges("math_agent", should_continue, {"tools": "math_tools", "__end__": END})
     builder.add_conditional_edges("general_agent", should_continue, {"tools": "general_tools", "__end__": END})
+
     builder.add_node("original_tools", original_tool_node)
     builder.add_node("technical_tools", technical_tool_node)
     builder.add_node("math_tools", math_tool_node)
     builder.add_node("general_tools", general_tool_node)
+    
     builder.add_edge("original_tools", "original_agent")
     builder.add_edge("technical_tools", "technical_agent")
     builder.add_edge("math_tools", "math_agent")
